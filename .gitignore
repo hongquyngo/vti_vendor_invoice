@@ -1,0 +1,8 @@
+__pycache__/
+.env
+**/desktop.ini
+docs/
+credentials.json
+*.pyc
+sql/
+local_requirements.txt

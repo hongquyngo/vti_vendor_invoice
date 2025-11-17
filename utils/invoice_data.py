@@ -251,41 +251,90 @@ def get_filter_options() -> Dict:
         }
 
 def get_invoice_details(can_line_ids: List[int]) -> pd.DataFrame:
-    """Get detailed information for selected CAN lines"""
+    """
+    Get detailed information for selected CAN lines
+    
+    CRITICAL FIX: Use direct FK from arrival_details.product_purchase_order_id
+    instead of complex join via products table which causes wrong mapping
+    """
     try:
         engine = get_db_engine()
         
+        # FIXED QUERY - Use direct FKs, no complex product matching
         query = """
         SELECT 
-            can.can_line_id,
-            can.arrival_note_number,
-            can.po_number,
-            can.vendor_code,
-            can.vendor,
-            can.product_name,
-            can.pt_code,
-            can.buying_uom,
-            can.uninvoiced_quantity,
-            can.buying_unit_cost,
-            can.payment_term,
+            ad.id AS can_line_id,
+            ad.id AS arrival_detail_id,
+            
+            -- Direct FK from arrival_details (CORRECT!)
+            ad.product_purchase_order_id,
+            ppo.purchase_order_id,
+            
+            -- AN Info
+            a.arrival_note_number,
+            
+            -- PO Info
+            po.po_number,
             po.currency_id AS po_currency_id,
             c.code AS po_currency_code,
             po.seller_company_id AS vendor_id,
             po.buyer_company_id AS entity_id,
             po.payment_term_id,
+            
+            -- Payment Terms
             pt.name AS payment_term_name,
-            po.id AS purchase_order_id,
-            ppo.id AS product_purchase_order_id,
-            ad.id AS arrival_detail_id
-        FROM can_tracking_full_view can
-        JOIN purchase_orders po ON can.po_number = po.po_number
-        JOIN product_purchase_orders ppo ON ppo.purchase_order_id = po.id 
-            AND ppo.product_id = (SELECT id FROM products WHERE pt_code = can.pt_code LIMIT 1)
-        JOIN arrival_details ad ON ad.id = can.can_line_id
-        JOIN currencies c ON po.currency_id = c.id
-        LEFT JOIN payment_terms pt ON po.payment_term_id = pt.id
-        WHERE can.can_line_id IN :can_line_ids
+            
+            -- Product Info (from ppo, not from can_tracking_full_view)
+            p.name AS product_name,
+            p.pt_code,
+            
+            -- Vendor Info
+            seller.english_name AS vendor,
+            seller.company_code AS vendor_code,
+            
+            -- Quantity & Cost
+            ad.arrival_quantity AS uninvoiced_quantity,
+            ppo.purchaseuom AS buying_uom,
+            CONCAT(
+                ROUND(ppo.purchase_unit_cost, 2), 
+                ' ', 
+                c.code
+            ) AS buying_unit_cost,
+            
+            -- Payment term from view (for compatibility)
+            pt.name AS payment_term
+            
+        FROM arrival_details ad
+        
+        -- Core joins using direct FKs (CORRECT PATH)
+        INNER JOIN arrivals a 
+            ON a.id = ad.arrival_id 
+            AND a.delete_flag = 0
+        
+        INNER JOIN product_purchase_orders ppo 
+            ON ppo.id = ad.product_purchase_order_id  -- Direct FK!
+            AND ppo.delete_flag = 0
+        
+        INNER JOIN purchase_orders po 
+            ON po.id = ppo.purchase_order_id
             AND po.delete_flag = 0
+        
+        INNER JOIN products p 
+            ON p.id = ppo.product_id
+        
+        INNER JOIN companies seller 
+            ON seller.id = po.seller_company_id
+        
+        INNER JOIN currencies c 
+            ON c.id = po.currency_id
+        
+        LEFT JOIN payment_terms pt 
+            ON pt.id = po.payment_term_id
+        
+        WHERE ad.id IN :can_line_ids
+            AND ad.delete_flag = 0
+        
+        ORDER BY a.arrival_note_number, ad.id
         """
         
         with engine.connect() as conn:
@@ -299,6 +348,7 @@ def get_invoice_details(can_line_ids: List[int]) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"Error getting invoice details: {e}")
         return pd.DataFrame()
+    
 
 def validate_invoice_selection(selected_df: pd.DataFrame) -> Tuple[bool, str]:
     """

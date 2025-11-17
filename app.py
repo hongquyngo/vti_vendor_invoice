@@ -24,7 +24,7 @@ def show_login_form():
     
     with col2:
         st.title("📄 Purchase Invoice Management")
-        st.markdown("---")
+        # st.markdown("---")
         
         with st.form("login_form"):
             username = st.text_input("Username", placeholder="Enter your username")

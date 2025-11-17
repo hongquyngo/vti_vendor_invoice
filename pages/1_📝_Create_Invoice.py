@@ -2,7 +2,7 @@
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import time
 import logging
 from typing import Dict, Set, Optional, List
@@ -39,6 +39,8 @@ from utils.invoice_attachments import (
     cleanup_failed_uploads
 )
 from utils.s3_utils import S3Manager
+
+from utils.payment_terms_calculator import PaymentTermParser
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -226,7 +228,7 @@ def show_progress_indicator():
         else:
             st.info("⭕ Step 3: Confirm & Submit")
     
-    st.markdown("---")
+    # st.markdown("---")
 
 # ============================================================================
 # STEP 1: AN SELECTION
@@ -1000,7 +1002,7 @@ def show_currency_selection(po_currency_code: str, po_currency_id: int):
         state.exchange_rates = rates
 
 def show_payment_terms():
-    """Show payment terms selection"""
+    """Show payment terms selection with enhanced due date calculation"""
     state = StateManager.get_state()
     service = InvoiceService()
     
@@ -1033,7 +1035,7 @@ def show_payment_terms():
             'Net 30': {'id': 1, 'days': 30, 'description': 'Payment due in 30 days'}
         }
     
-    st.markdown("---")
+    # st.markdown("---")
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1043,33 +1045,91 @@ def show_payment_terms():
         if state.selected_payment_term in term_names:
             default_index = term_names.index(state.selected_payment_term)
         
+        # Payment term selection
         selected_term = st.selectbox(
             "Payment Terms",
             options=term_names,
             index=default_index,
-            help=f"Payment terms from selected ANs ({len(term_names)} option(s) available)"
+            help=f"Payment terms from selected ANs ({len(term_names)} option(s) available)",
+            key="payment_term_selector"
         )
         
+        # Store selected term and ID
         state.selected_payment_term = selected_term
+        state.payment_term_id = term_options[selected_term]['id']
         
         if term_options[selected_term].get('description'):
             st.caption(term_options[selected_term]['description'])
     
     with col2:
-        state.invoice_date = st.date_input(
+        # Invoice date input
+        invoice_date = st.date_input(
             "Invoice Date",
-            value=state.invoice_date
+            value=state.invoice_date,
+            key="invoice_date_input"
         )
+        
+        # Update state if changed
+        if invoice_date != state.invoice_date:
+            state.invoice_date = invoice_date
+            # Recalculate due date when invoice date changes
+            state.due_date = None  # Force recalculation
     
-    # Calculate due date
-    term_days = term_options[state.selected_payment_term]['days']
-    state.due_date = service.calculate_due_date(state.invoice_date, term_days)
+    # Calculate due date using enhanced parser
+    parser = PaymentTermParser()
+    calculated_due_date, explanation, needs_review = parser.calculate_due_date(
+        state.selected_payment_term,
+        state.invoice_date,
+        term_options[state.selected_payment_term].get('description', '')
+    )
     
-    # Store payment term ID
-    state.payment_term_id = term_options[state.selected_payment_term]['id']
+    # Initialize due date if not set or if payment term changed
+    if state.due_date is None:
+        state.due_date = calculated_due_date if calculated_due_date else state.invoice_date + timedelta(days=30)
+    
+    # Show due date section with editability
+    # st.markdown("---")
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # EDITABLE due date field
+        new_due_date = st.date_input(
+            "Due Date",
+            value=state.due_date,
+            min_value=state.invoice_date,  # Cannot be before invoice date
+            help=f"Auto-calculated: {explanation}. You can adjust this date if needed.",
+            key="due_date_input"
+        )
+        
+        # Update state if changed
+        if new_due_date != state.due_date:
+            state.due_date = new_due_date
+        
+        # Show explanation
+        if needs_review:
+            st.warning(f"⚠️ {explanation}")
+            st.caption("💡 Please review and adjust the due date if needed.")
+        else:
+            st.info(f"ℹ️ {explanation}")
+    
+    with col2:
+        # Calculate days difference
+        if state.due_date and state.invoice_date:
+            days_diff = (state.due_date - state.invoice_date).days
+            st.metric(
+                label="Payment Term Days",
+                value=f"{days_diff} days",
+                help="Number of days from invoice date to due date"
+            )
+        
+        # Recalculate button
+        if st.button("🔄 Recalculate", help="Reset due date to auto-calculated value"):
+            state.due_date = calculated_due_date if calculated_due_date else state.invoice_date + timedelta(days=30)
+            st.rerun()
+
 
 def show_invoice_form(invoice_number: str, po_currency_code: str, service: InvoiceService):
-    """Show invoice form with summary"""
+    """Show invoice form with summary - UPDATED VERSION"""
     state = StateManager.get_state()
     
     with st.form("invoice_form"):
@@ -1093,11 +1153,12 @@ def show_invoice_form(invoice_number: str, po_currency_code: str, service: Invoi
             else:
                 st.caption("⚠️ Required field for commercial invoices")
             
-            st.date_input(
+            # Display due date (read-only in form)
+            st.text_input(
                 "Due Date",
-                value=state.due_date,
+                value=str(state.due_date),
                 disabled=True,
-                help=f"Auto-calculated: Invoice Date + payment term days"
+                help="Configured in payment terms section above"
             )
             
             state.email_to_accountant = st.checkbox(
@@ -1156,8 +1217,18 @@ def show_invoice_form(invoice_number: str, po_currency_code: str, service: Invoi
         st.rerun()
     
     if proceed_btn:
+        # Validation
         if not state.is_advance_payment and not state.commercial_invoice_no:
             st.error("❌ Commercial Invoice Number is required for Commercial Invoices")
+            return
+        
+        # Validate due date
+        if not state.due_date:
+            st.error("❌ Due date is required")
+            return
+        
+        if state.due_date < state.invoice_date:
+            st.error("❌ Due date cannot be before invoice date")
             return
         
         # Prepare invoice data
@@ -1167,7 +1238,7 @@ def show_invoice_form(invoice_number: str, po_currency_code: str, service: Invoi
             'invoice_number': invoice_number,
             'commercial_invoice_no': state.commercial_invoice_no if not state.is_advance_payment else '',
             'invoiced_date': state.invoice_date,
-            'due_date': state.due_date,
+            'due_date': state.due_date,  # Use the user-editable due date
             'total_invoiced_amount': totals['total_with_vat'],
             'currency_id': state.invoice_currency_id,
             'usd_exchange_rate': usd_rate,

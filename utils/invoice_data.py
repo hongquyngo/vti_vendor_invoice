@@ -8,6 +8,7 @@ from datetime import datetime, date, timedelta
 import logging
 from typing import List, Dict, Optional, Tuple
 from .db import get_db_engine
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -348,7 +349,6 @@ def get_invoice_details(can_line_ids: List[int]) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"Error getting invoice details: {e}")
         return pd.DataFrame()
-    
 
 def validate_invoice_selection(selected_df: pd.DataFrame) -> Tuple[bool, str]:
     """
@@ -648,22 +648,46 @@ def get_payment_terms() -> pd.DataFrame:
         ])
 
 def calculate_days_from_term_name(term_name: str) -> int:
-    """Calculate days from payment term name"""
+    """
+    Calculate days from payment term name - ENHANCED VERSION
+    Uses PaymentTermParser for accurate parsing
+    """
     if pd.isna(term_name):
         return 30
     
-    term_name = str(term_name)
+    term_name = str(term_name).strip()
+    term_upper = term_name.upper()
     
-    if term_name.startswith('Net '):
-        try:
-            days_str = term_name.replace('Net ', '').split()[0]
-            return int(days_str)
-        except:
-            return 30
-    elif term_name in ['COD', 'CIA', 'TT IN ADVANCE'] or 'Advance' in term_name:
+    # Check immediate payment
+    immediate_terms = ['COD', 'CIA', 'TT IN ADVANCE', 'ADVANCE', 'PREPAID']
+    if any(term in term_upper for term in immediate_terms):
         return 0
-    else:
-        return 30
+    
+    # Extract number with regex - NET pattern
+    net_pattern = r'NET\s+(\d+)'
+    match = re.search(net_pattern, term_upper)
+    if match:
+        return int(match.group(1))
+    
+    # AMS pattern
+    ams_pattern = r'AMS\s+(\d+)'
+    match = re.search(ams_pattern, term_upper)
+    if match:
+        return int(match.group(1)) + 15  # Approximate
+    
+    # Days pattern
+    days_pattern = r'(\d+)\s*DAYS?'
+    match = re.search(days_pattern, term_upper)
+    if match:
+        return int(match.group(1))
+    
+    # Any number
+    number_pattern = r'\d+'
+    match = re.search(number_pattern, term_name)
+    if match:
+        return int(match.group(0))
+    
+    return 30
 
 @st.cache_data(ttl=60)
 def get_po_line_summary(po_line_ids: List[int]) -> pd.DataFrame:
